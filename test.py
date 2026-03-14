@@ -1,33 +1,74 @@
-import hashlib
 import datetime
 import functools
+import hashlib
+import json
 import unittest
 
 import api
+import scoring
 
 
-def cases(cases):
+def cases(cases_list):
+    """Parametrize a test method with multiple input cases.
+
+    On failure each subtest reports exactly which case caused it.
+    """
+
     def decorator(f):
         @functools.wraps(f)
         def wrapper(*args):
-            for c in cases:
-                new_args = args + (c if isinstance(c, tuple) else (c,))
-                f(*new_args)
+            for c in cases_list:
+                with args[0].subTest(case=c):
+                    new_args = args + (c if isinstance(c, tuple) else (c,))
+                    f(*new_args)
 
         return wrapper
 
     return decorator
 
 
+class FakeStore:
+    """In-memory store that implements the same interface as RedisStore.
+
+    Pass ``unavailable=True`` to simulate a broken connection:
+    - ``get`` raises ``ConnectionError``
+    - ``cache_get`` / ``cache_set`` silently do nothing
+    """
+
+    def __init__(self, data: dict | None = None, unavailable: bool = False):
+        self._data: dict = dict(data or {})
+        self._unavailable = unavailable
+
+    def get(self, key: str):
+        if self._unavailable:
+            raise ConnectionError("Store unavailable")
+        return self._data.get(key)
+
+    def cache_get(self, key: str):
+        if self._unavailable:
+            return None
+        return self._data.get(key)
+
+    def cache_set(self, key: str, value, ttl=None):
+        if not self._unavailable:
+            self._data[key] = str(value)
+
+
+def _make_interests_store(*cids) -> FakeStore:
+    """Return a FakeStore pre-populated with two interests for each given cid"""
+    data = {f"i:{cid}": json.dumps(["books", "hi-tech"]) for cid in cids}
+    return FakeStore(data=data)
+
+
 class TestSuite(unittest.TestCase):
     def setUp(self):
         self.context = {}
         self.headers = {}
-        self.settings = {}
+        self.store = _make_interests_store(*range(10))
 
     def get_response(self, request):
         return api.method_handler(
-            {"body": request, "headers": self.headers}, self.context, self.settings
+            {"body": request, "headers": self.headers}, self.context, self.store
         )
 
     def set_valid_auth(self, request):
@@ -243,6 +284,179 @@ class TestSuite(unittest.TestCase):
             )
         )
         self.assertEqual(self.context.get("nclients"), len(arguments["client_ids"]))
+
+
+class TestFieldValidation(unittest.TestCase):
+    """Unit tests for individual Field descriptor validators"""
+
+    def _field(self, cls, **kwargs):
+        f = cls(**kwargs)
+        f.name = "f"
+        return f
+
+    def test_char_field_accepts_string(self):
+        f = self._field(api.CharField)
+        self.assertEqual("hello", f.validate("hello"))
+
+    def test_char_field_accepts_none(self):
+        f = self._field(api.CharField)
+        self.assertIsNone(f.validate(None))
+
+    def test_char_field_rejects_non_string(self):
+        f = self._field(api.CharField)
+        with self.assertRaises(ValueError):
+            f.validate(42)
+
+    def test_email_field_requires_at_sign(self):
+        f = self._field(api.EmailField)
+        with self.assertRaises(ValueError):
+            f.validate("noatsign.com")
+
+    def test_email_field_accepts_valid_email(self):
+        f = self._field(api.EmailField)
+        self.assertEqual("a@b.com", f.validate("a@b.com"))
+
+    def test_email_field_accepts_empty(self):
+        f = self._field(api.EmailField)
+        self.assertEqual("", f.validate(""))
+
+    @cases(
+        [
+            "1234567890",  # 10 chars
+            "791750020401",  # 12 chars
+            "89175002040",  # starts with 8
+            "7917500204x",  # non-digit (length ok, starts with 7)
+        ]
+    )
+    def test_phone_field_rejects_invalid(self, value):
+        f = self._field(api.PhoneField)
+        with self.assertRaises(ValueError):
+            f.validate(value)
+
+    def test_phone_field_accepts_string(self):
+        f = self._field(api.PhoneField)
+        self.assertEqual("79175002040", f.validate("79175002040"))
+
+    def test_phone_field_accepts_int(self):
+        f = self._field(api.PhoneField)
+        self.assertEqual(79175002040, f.validate(79175002040))
+
+    def test_date_field_accepts_valid_date(self):
+        f = self._field(api.DateField)
+        self.assertEqual("01.01.2000", f.validate("01.01.2000"))
+
+    def test_date_field_rejects_wrong_format(self):
+        f = self._field(api.DateField)
+        with self.assertRaises(ValueError):
+            f.validate("2000-01-01")
+
+    def test_date_field_rejects_garbage(self):
+        f = self._field(api.DateField)
+        with self.assertRaises(ValueError):
+            f.validate("XXX")
+
+    def test_birthday_field_rejects_too_old(self):
+        f = self._field(api.BirthDayField)
+        with self.assertRaises(ValueError):
+            f.validate("01.01.1890")
+
+    def test_birthday_field_accepts_recent(self):
+        f = self._field(api.BirthDayField)
+        self.assertEqual("01.01.2000", f.validate("01.01.2000"))
+
+    @cases([api.UNKNOWN, api.MALE, api.FEMALE])
+    def test_gender_field_accepts_valid(self, value):
+        f = self._field(api.GenderField)
+        self.assertEqual(value, f.validate(value))
+
+    @cases([-1, 3, "1"])
+    def test_gender_field_rejects_invalid(self, value):
+        f = self._field(api.GenderField)
+        with self.assertRaises(ValueError):
+            f.validate(value)
+
+    def test_client_ids_rejects_empty_list(self):
+        f = self._field(api.ClientIDsField)
+        with self.assertRaises(ValueError):
+            f.validate([])
+
+    def test_client_ids_rejects_non_int_elements(self):
+        f = self._field(api.ClientIDsField)
+        with self.assertRaises(ValueError):
+            f.validate(["1", "2"])
+
+    def test_client_ids_rejects_dict(self):
+        f = self._field(api.ClientIDsField)
+        with self.assertRaises(ValueError):
+            f.validate({1: 2})
+
+    def test_client_ids_accepts_valid_list(self):
+        f = self._field(api.ClientIDsField)
+        self.assertEqual([1, 2, 3], f.validate([1, 2, 3]))
+
+
+class TestGetScore(unittest.TestCase):
+    """Unit tests for scoring.get_score with FakeStore"""
+
+    def test_returns_float(self):
+        store = FakeStore()
+        result = scoring.get_score(store, phone="79175002040", email="x@y.com")
+        self.assertIsInstance(result, float)
+
+    def test_phone_email_pair_gives_3_points(self):
+        store = FakeStore()
+        score = scoring.get_score(store, phone="79175002040", email="x@y.com")
+        self.assertEqual(3.0, score)
+
+    def test_first_last_name_gives_half_point(self):
+        store = FakeStore()
+        score = scoring.get_score(store, first_name="Ivan", last_name="Petrov")
+        self.assertEqual(0.5, score)
+
+    def test_gender_birthday_gives_1_5_points(self):
+        store = FakeStore()
+        bd = datetime.datetime(2000, 1, 1)
+        score = scoring.get_score(store, gender=api.MALE, birthday=bd)
+        self.assertEqual(1.5, score)
+
+    def test_cache_hit_returns_cached_value(self):
+        store = FakeStore()
+        key = list(store._data.keys())[0]
+        store._data[key] = "99.9"
+        score2 = scoring.get_score(store, phone="79175002040", email="x@y.com")
+        self.assertEqual(99.9, score2)
+
+    def test_works_when_store_unavailable(self):
+        """get_score must not raise when the cache store is down"""
+        store = FakeStore(unavailable=True)
+        score = scoring.get_score(store, phone="79175002040", email="x@y.com")
+        self.assertIsInstance(score, float)
+        self.assertGreaterEqual(score, 0)
+
+    def test_empty_args_give_zero_score(self):
+        store = FakeStore()
+        score = scoring.get_score(store)
+        self.assertEqual(0.0, score)
+
+
+class TestGetInterests(unittest.TestCase):
+    """Unit tests for scoring.get_interests with FakeStore"""
+
+    def test_returns_list_from_store(self):
+        store = FakeStore(data={"i:1": json.dumps(["books", "cars"])})
+        result = scoring.get_interests(store, 1)
+        self.assertEqual(["books", "cars"], result)
+
+    def test_returns_empty_list_when_key_missing(self):
+        store = FakeStore()
+        result = scoring.get_interests(store, 999)
+        self.assertEqual([], result)
+
+    def test_raises_when_store_unavailable(self):
+        """get_interests must propagate store errors (persistent storage)"""
+        store = FakeStore(unavailable=True)
+        with self.assertRaises(Exception):
+            scoring.get_interests(store, 1)
 
 
 if __name__ == "__main__":

@@ -5,11 +5,13 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import uuid
 from argparse import ArgumentParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import scoring
+from store import RedisStore
 
 SALT = "Otus"
 ADMIN_LOGIN = "admin"
@@ -94,6 +96,8 @@ class PhoneField(Field):
             raise ValueError(f"{self.name}: must be 11 characters long")
         if not phone.startswith("7"):
             raise ValueError(f"{self.name}: must start with '7'")
+        if not phone.isdigit():
+            raise ValueError(f"{self.name}: must contain digits only")
         return value
 
 
@@ -281,11 +285,13 @@ def online_score_handler(request: MethodRequest, ctx: dict, store):
     if request.is_admin:
         return {"score": 42}, OK
 
+    birthday_dt = DateField.parse(score_req.birthday) if score_req.birthday else None
+    phone = str(score_req.phone) if score_req.phone is not None else None
     score = scoring.get_score(
         store,
-        phone=score_req.phone,
+        phone=phone,
         email=score_req.email,
-        birthday=score_req.birthday,
+        birthday=birthday_dt,
         gender=score_req.gender,
         first_name=score_req.first_name,
         last_name=score_req.last_name,
@@ -381,6 +387,10 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("-p", "--port", action="store", type=int, default=8080)
     parser.add_argument("-l", "--log", action="store", default=None)
+    parser.add_argument("--redis-host", default=os.getenv("REDIS_HOST", "localhost"))
+    parser.add_argument(
+        "--redis-port", type=int, default=int(os.getenv("REDIS_PORT", "6379"))
+    )
     args = parser.parse_args()
     logging.basicConfig(
         filename=args.log,
@@ -388,6 +398,7 @@ if __name__ == "__main__":
         format="[%(asctime)s] %(levelname).1s %(message)s",
         datefmt="%Y.%m.%d %H:%M:%S",
     )
+    MainHTTPHandler.store = RedisStore(host=args.redis_host, port=args.redis_port)
     server = HTTPServer(("", args.port), MainHTTPHandler)
     logging.info("Starting server at %s" % args.port)
     try:
