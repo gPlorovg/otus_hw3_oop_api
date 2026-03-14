@@ -6,7 +6,9 @@ PYTHON  := uv run python
 PYTEST  := uv run python -m pytest
 TESTS   := test.py
 
-.PHONY: all install lint test run docker-build docker-run docker-test
+.PHONY: all install lint test run \
+        docker-build docker-run docker-test \
+        compose-up compose-down
 
 all: lint test
 
@@ -33,3 +35,11 @@ docker-test:
 
 docker-run:
 	docker run $(if $(filter run,$(MODE)),-d) --rm -p $(PORT):8080 $(IMAGE)-$(MODE)
+
+compose-up:
+	@echo "Starting API + Redis..."
+	docker compose up -d --build
+
+compose-down:
+	@echo "Stopping services..."
+	docker compose down

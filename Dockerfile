@@ -10,7 +10,7 @@ RUN uv sync --frozen --no-cache --no-install-project
 # --- Stage 2: Runtime  ---
 FROM base AS run
 
-COPY api.py scoring.py ./
+COPY api.py scoring.py store.py ./
 
 EXPOSE 8080
 
@@ -19,6 +19,6 @@ CMD ["uv", "run", "python", "api.py", "--port", "8080"]
 # --- Stage 3: Test ---
 FROM base AS test
 
-COPY api.py scoring.py test.py ./
+COPY api.py scoring.py store.py test.py ./
 
 CMD ["uv", "run", "python", "-m", "pytest", "test.py", "-v"]
